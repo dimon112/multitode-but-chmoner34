@@ -1,5 +1,7 @@
 package dev.multitode.bridge.shared.net;
 
+import com.prineside.tdi2.utils.logging.TLog;
+
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -7,11 +9,25 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class SessionRegistry {
+    private static final TLog LOGGER = TLog.forTag("multitode/SessionRegistry");
+
+    /**
+     * Lua drains at most a fixed budget per render callback, so a peer that sends
+     * faster than that would otherwise grow this queue without bound. Also a
+     * plain robustness limit: any burst after a stall (level load, window drag,
+     * long GC) queues faster than it drains.
+     */
+    private static final int MAX_PENDING_LUA_MESSAGES = 4096;
+    private static final int DROP_LOG_EVERY = 100;
+
     private final LocalSessionInfo localSessionInfo = new LocalSessionInfo();
     private final Map<Integer, PeerInfo> peersByPlayerId = new ConcurrentHashMap<>();
     private final Queue<InboundLuaMessage> inboundLuaMessages = new ConcurrentLinkedQueue<>();
+    private final AtomicLong droppedInboundLuaMessages = new AtomicLong();
+    private final AtomicLong lastDropWarningAt = new AtomicLong();
 
     public LocalSessionInfo getLocalSessionInfo() {
         return localSessionInfo;
@@ -68,7 +84,23 @@ public final class SessionRegistry {
         return builder.toString();
     }
 
+    /**
+     * Non-blocking, never rejects the caller: on overflow the newest message is
+     * dropped so the network read thread is never stalled by a slow consumer.
+     */
     public void enqueueInboundLuaMessage(InboundLuaMessage message) {
+        if (inboundLuaMessages.size() >= MAX_PENDING_LUA_MESSAGES) {
+            long total = droppedInboundLuaMessages.incrementAndGet();
+            long now = System.currentTimeMillis();
+            long last = lastDropWarningAt.get();
+            // Rate-limited so a flood cannot turn the warning itself into the load.
+            if (total % DROP_LOG_EVERY == 1 && now - last > 1000L
+                    && lastDropWarningAt.compareAndSet(last, now)) {
+                LOGGER.w("Inbound Lua message queue full (cap %d); dropped %d so far",
+                        MAX_PENDING_LUA_MESSAGES, total);
+            }
+            return;
+        }
         inboundLuaMessages.add(message);
     }
 
@@ -78,6 +110,10 @@ public final class SessionRegistry {
 
     public int getPendingLuaMessageCount() {
         return inboundLuaMessages.size();
+    }
+
+    public long getDroppedInboundLuaMessageCount() {
+        return droppedInboundLuaMessages.get();
     }
 
     public String describe() {

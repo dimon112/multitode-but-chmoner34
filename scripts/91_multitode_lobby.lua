@@ -798,9 +798,12 @@ local function ensure_handlers_registered()
         logger:i("Player joined: %s (id=%s)", playerName, senderId)
     end)
 
-    -- Host receives leave request
+    -- Host receives leave request.
+    -- Identity comes from ctx.senderPlayerId, which the bridge authenticates.
+    -- payload.playerId is attacker-controlled: trusting it let a peer evict
+    -- anyone else from the roster.
     multitode.net.onHost(CHANNEL, "leave", function(ctx, payload)
-        local playerId = tonumber(payload and payload.playerId) or tonumber(ctx.senderPlayerId) or 0
+        local playerId = tonumber(ctx.senderPlayerId) or 0
         local playerInfo = lobby.players[playerId]
         if playerInfo then
             add_chat_message("System", playerInfo.name .. " left the lobby")
@@ -963,13 +966,25 @@ local function ensure_handlers_registered()
         add_chat_message("System", tostring(payload.text or "Poll notice"))
     end)
 
-    -- Host receives ready update from a client: apply + rebroadcast to all
+    -- Host receives ready update from a client: apply + rebroadcast to all.
+    -- ctx.senderPlayerId decides WHO is being updated; payload.playerId is only
+    -- read to confirm the two agree, and a mismatch is rejected rather than
+    -- applied. Otherwise a peer could flip another member's ready flag.
     multitode.net.onHost(CHANNEL, "player_ready", function(ctx, payload)
         if payload == nil then return end
-        local playerId = tonumber(payload.playerId) or tonumber(ctx.senderPlayerId) or 0
-        if lobby.players[playerId] then
-            lobby.players[playerId].ready = payload.ready
+        local playerId = tonumber(ctx.senderPlayerId) or 0
+        local claimedId = tonumber(payload.playerId)
+        if claimedId ~= nil and claimedId ~= playerId then
+            pcall(function()
+                multitode.slog("CHAT", string.format(
+                    "REJECT ready id-mismatch from=%s claimed=%s", tostring(playerId), tostring(claimedId)))
+            end)
+            return
         end
+        if not lobby.players[playerId] then
+            return
+        end
+        lobby.players[playerId].ready = payload.ready
         multitode.net.broadcast(CHANNEL, "player_ready", {
             playerId = playerId,
             ready = payload.ready
@@ -977,21 +992,31 @@ local function ensure_handlers_registered()
         flag_ready_refresh()
     end)
 
-    -- Host receives chat from a client: log + rebroadcast to everyone
+    -- Host receives chat from a client: log + rebroadcast to everyone.
+    -- The displayed name comes from the roster, never from payload.sender, so a
+    -- peer cannot appear in chat as somebody else.
     multitode.net.onHost(CHANNEL, "chat", function(ctx, payload)
         if payload == nil then return end
-        local senderId = tonumber(payload.senderId) or tonumber(ctx.senderPlayerId) or 0
+        local senderId = tonumber(ctx.senderPlayerId) or 0
         -- Skip our own loopback echo (host broadcasts reach its own client too)
         if senderId == get_self_id() then
             return
         end
-        add_chat_message(payload.sender or "?", payload.message or "", payload.refs)
+        local senderInfo = lobby.players[senderId]
+        if senderInfo == nil then
+            pcall(function()
+                multitode.slog("CHAT", string.format("REJECT chat from non-member id=%s", tostring(senderId)))
+            end)
+            return
+        end
+        local senderName = senderInfo.name or "?"
+        add_chat_message(senderName, payload.message or "", payload.refs)
         pcall(function()
             multitode.slog("CHAT", string.format("HOST-RECV from=%s: %s",
-                tostring(payload.sender or "?"), tostring(payload.message or "")))
+                tostring(senderName), tostring(payload.message or "")))
         end)
         multitode.net.broadcast(CHANNEL, "chat", {
-            sender = payload.sender,
+            sender = senderName,
             senderId = senderId,
             message = payload.message,
             refs = payload.refs
@@ -1101,9 +1126,28 @@ local function ensure_handlers_registered()
     end)
 
     -- All: marks on/off flag for the "marks off" roster badge.
+    -- This runs on both sides. As the HOST receiving a client message, the player
+    -- is whoever the transport says, not whoever the payload claims. As a CLIENT
+    -- receiving the host's rebroadcast, payload.playerId is authoritative because
+    -- the host set it.
     multitode.net.on(CHANNEL, "marks_flag", function(ctx, payload)
         if payload == nil then return end
-        local playerId = tonumber(payload.playerId) or tonumber(ctx and ctx.senderPlayerId) or 0
+        local fromHost = (ctx ~= nil and ctx.receiverContext == "HOST")
+        local claimedId = tonumber(payload.playerId)
+        local playerId
+        if fromHost then
+            playerId = tonumber(ctx.senderPlayerId) or 0
+            if claimedId ~= nil and claimedId ~= playerId then
+                pcall(function()
+                    multitode.slog("CHAT", string.format(
+                        "REJECT marks_flag id-mismatch from=%s claimed=%s",
+                        tostring(playerId), tostring(claimedId)))
+                end)
+                return
+            end
+        else
+            playerId = claimedId or 0
+        end
         local off = (payload.enabled ~= true)
         if lobby.players[playerId] then
             lobby.players[playerId].marksOff = off

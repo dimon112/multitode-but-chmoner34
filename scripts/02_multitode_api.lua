@@ -200,8 +200,10 @@ end
 
 multitode.version = multitode.getApi():getVersion()
 
--- Wall-clock milliseconds. os.clock() is per-process CPU time, which is useless
--- for debounce / timeout logic (and for cross-instance comparisons).
+-- Wall-clock milliseconds. os.clock() would not work here: it is wall-clock
+-- seconds since LuaJ loaded in THIS JVM, so it is fine for same-process
+-- elapsed time but has a per-JVM origin and cannot be compared across
+-- instances. System.currentTimeMillis() is absolute on both.
 multitode.now_ms = function()
     local ok, System = pcall(luajava.bindClass, "java.lang.System")
     if not ok or System == nil then
@@ -411,14 +413,33 @@ multitode.net.getPendingCount = function()
     return multitode.getApi():getPendingLuaMessageCount()
 end
 
-multitode.net.poll = function()
-    local rawMessageJson = multitode.getApi():pollInboundLuaMessageJson()
-    if rawMessageJson == nil then
-        return nil
-    end
+    multitode.net.poll = function()
+        local rawMessageJson = multitode.getApi():pollInboundLuaMessageJson()
+        if rawMessageJson == nil then
+            return nil
+        end
 
-    return decode_json_value(jsonReader:parse(rawMessageJson))
-end
+        -- One malformed payload must not kill the whole dispatch pass. An
+        -- uncaught throw here aborted dispatchPending mid-loop, so every message
+        -- still queued behind it was lost along with the pass. Drop this one,
+        -- note it, and let the next poll carry on.
+        local ok, envelope = pcall(function()
+            return decode_json_value(jsonReader:parse(rawMessageJson))
+        end)
+        if not ok then
+            multitode.net._decodeErrors = (multitode.net._decodeErrors or 0) + 1
+            if multitode.net._decodeErrors <= 5 or multitode.net._decodeErrors % 50 == 0 then
+                logger:w("Dropped malformed inbound Lua message (#%d): %s",
+                    tostring(multitode.net._decodeErrors), tostring(envelope))
+            end
+            return nil
+        end
+        if type(envelope) ~= "table" then
+            multitode.net._decodeErrors = (multitode.net._decodeErrors or 0) + 1
+            return nil
+        end
+        return envelope
+    end
 
 -- ============================================================
 -- Per-env append-only markers (clobber-proof diagnostics)    --
@@ -591,7 +612,18 @@ multitode.net.dispatchPending = function(limit)
     local maxCount = limit
 
     while processed < maxCount do
-        local envelope = multitode.net.poll()
+        -- pcall the poll itself: a throw from the bridge or the JSON reader must
+        -- not escape and abort the whole pass, losing every message still queued.
+        local pollOk, envelope = pcall(multitode.net.poll)
+        if not pollOk then
+            multitode.net._dispatchErrors = (multitode.net._dispatchErrors or 0) + 1
+            if multitode.net._dispatchErrors <= 5
+                    or multitode.net._dispatchErrors % 50 == 0 then
+                logger:w("Inbound poll failed (#%d): %s",
+                    tostring(multitode.net._dispatchErrors), tostring(envelope))
+            end
+            break
+        end
         if envelope == nil then
             break
         end
@@ -643,7 +675,9 @@ multitode.net.enableAutoDispatch = function(limit)
             multitode.net._dispatchRanMarker = true
             multitode.net.appendEnvMarker("dispatch-listener-ran")
         end
-        multitode.net.dispatchPending(limit)
+        -- Guard the listener body: a throw on the JVM-global Render bus would
+        -- otherwise propagate into the game's own event dispatch every frame.
+        pcall(multitode.net.dispatchPending, limit)
     end))
     autoDispatchRegistered = true
     logger:i("Enabled automatic message dispatch")
@@ -925,24 +959,95 @@ multitode.superlog_maybe_install = function()
     return installed
 end
 
+-- The STATE emitter is installed per Lua env, but a script re-execution creates a
+-- NEW env while the old Java-side SystemsSetup/SystemsStateRestore listeners stay
+-- alive. The old env's _superlogSessionInstalled flag dies with it, so both envs
+-- install an emitter and the STATE line prints twice. Observed 2026-09-24.
+--
+-- Fix mirrors the heartbeat driver: stamp a JVM system property with an
+-- env-generation counter at install time, and let the listener check that the
+-- generation it captured is still current. Lua flags cannot do this (they are
+-- per-env); a system property survives the re-execution.
 local function superlog_install_for_session()
     if C.Game == nil or C.Game.EVENTS == nil then
         return
     end
 
+    local function current_gen()
+        local ok, System = pcall(luajava.bindClass, "java.lang.System")
+        if not ok or System == nil then
+            return nil
+        end
+        local gen = nil
+        pcall(function()
+            gen = tonumber(System:getProperty("multitode.superlog.gen") or "0") or 0
+        end)
+        return gen
+    end
+
     local function install()
+        -- Claim a fresh generation for this env before installing.
+        local ok, System = pcall(luajava.bindClass, "java.lang.System")
+        local myGen = nil
+        if ok and System ~= nil then
+            pcall(function()
+                myGen = (tonumber(System:getProperty("multitode.superlog.gen") or "0") or 0) + 1
+                System:setProperty("multitode.superlog.gen", tostring(myGen))
+            end)
+        end
         multitode.superlog_maybe_install()
+        if myGen == nil then
+            return -- property bridge unavailable: cannot de-duplicate, stay permissive
+        end
+        -- Re-check after install: if another env claimed a newer generation while
+        -- we were installing, this env is the stale one and must not emit.
+        pcall(function()
+            if current_gen() ~= nil and tonumber(current_gen()) > myGen then
+                multitode._superlogSessionInstalled = nil
+            end
+        end)
+    end
+
+    local function guard(listener)
+        -- One extra hop so the generation check runs per event, not only at
+        -- install time. A stale env's listener turns into a no-op.
+        return function(evt)
+            local Sys = nil
+            local ok = pcall(function()
+                Sys = luajava.bindClass("java.lang.System")
+            end)
+            if ok and Sys ~= nil then
+                local cur = nil
+                pcall(function()
+                    cur = tonumber(Sys:getProperty("multitode.superlog.gen") or "0") or 0
+                end)
+                if cur ~= nil and cur > myGen then
+                    return
+                end
+            end
+            listener(evt)
+        end
+    end
+
+    local myGen = nil
+    do
+        local ok, System = pcall(luajava.bindClass, "java.lang.System")
+        if ok and System ~= nil then
+            pcall(function()
+                myGen = tonumber(System:getProperty("multitode.superlog.gen") or "0") or 0
+            end)
+        end
     end
 
     pcall(function()
-        C.Game.EVENTS:getListeners(C.SystemsSetup):add(C.Listener(function(_)
+        C.Game.EVENTS:getListeners(C.SystemsSetup):add(C.Listener(guard(function(_)
             install()
-        end))
+        end)))
     end)
     pcall(function()
-        C.Game.EVENTS:getListeners(C.SystemsStateRestore):add(C.Listener(function(_)
+        C.Game.EVENTS:getListeners(C.SystemsStateRestore):add(C.Listener(guard(function(_)
             install()
-        end))
+        end)))
     end)
 end
 

@@ -532,7 +532,25 @@ local function inspect_queued_actions()
                                 -- current tick lets a lagging client either miss the action or
                                 -- independently retarget it, which is a desync.
                                 local targetTick = authoritative_target_tick(tick)
-                                pcall(function()
+
+                                -- Drop the local copy FIRST. Doing this before the send
+                                -- means a later failure drops the action on every peer
+                                -- (the player retries by hand) instead of executing it
+                                -- here while the client never hears about it, which is
+                                -- the desync this whole path exists to prevent.
+                                --
+                                -- If neutralization itself fails the local copy stays
+                                -- live, so sending would leave it executing here while
+                                -- peers ran the announced copy. Bail before broadcasting.
+                                if not neutralize_queued_action(actions, i, actionType, actionString) then
+                                    captureOk = false
+                                    logger:w(
+                                        "Host action not announced: could not neutralize the local copy of %s (index %s)",
+                                        tostring(actionString), tostring(i - 1))
+                                    return
+                                end
+
+                                local sendOk, sendErr = pcall(function()
                                     multitode.approveQueuedAction(targetTick, actionString)
                                     multitode.getApi():broadcastLuaMessage("itd", "action_apply",
                                         multitode.net.encodePayload({
@@ -549,17 +567,29 @@ local function inspect_queued_actions()
                                             }
                                         }))
                                     S.state:pushAction(action, targetTick)
-                                    -- Remove the original current-tick copy; only the future
-                                    -- authoritative copy may execute.
-                                    neutralize_queued_action(actions, i, actionType, actionString)
                                 end)
-                                multitode.actStats = multitode.actStats or {}
-                                multitode.actStats.hostSent = (multitode.actStats.hostSent or 0) + 1
-                                pcall(function()
-                                    multitode.slog("ACT", string.format(
-                                        "HOST-SEND %s capTick=%s target=%s idx=%s (host's own action)",
-                                        tostring(actionName), tostring(tick), tostring(targetTick), tostring(i - 1)))
-                                end)
+
+                                -- Stats and the HOST-SEND line live inside the success
+                                -- path: previously both were written unconditionally, so
+                                -- the log claimed a transmission that never happened.
+                                if sendOk then
+                                    multitode.actStats = multitode.actStats or {}
+                                    multitode.actStats.hostSent = (multitode.actStats.hostSent or 0) + 1
+                                    pcall(function()
+                                        multitode.slog("ACT", string.format(
+                                            "HOST-SEND %s capTick=%s target=%s idx=%s (host's own action)",
+                                            tostring(actionName), tostring(tick), tostring(targetTick), tostring(i - 1)))
+                                    end)
+                                else
+                                    captureOk = false
+                                    logger:w("Host action capture failed for %s at tick %s: %s",
+                                        tostring(actionString), tostring(tick), tostring(sendErr))
+                                    pcall(function()
+                                        multitode.slog("ACT", string.format(
+                                            "HOST-SEND-FAIL %s capTick=%s target=%s idx=%s (dropped on all peers)",
+                                            tostring(actionName), tostring(tick), tostring(targetTick), tostring(i - 1)))
+                                    end)
+                                end
                             else
                                 multitode.actStats = multitode.actStats or {}
                                 multitode.actStats.captured = (multitode.actStats.captured or 0) + 1

@@ -246,6 +246,10 @@ function refs.parse(text)
             args[#args + 1] = token
         end
 
+        -- How many tokens each kind actually consumes. The capture runs to the
+        -- next '+', so anything past the consumed count is ordinary text and must
+        -- survive: "Meet at +map 1.1 after wave" has to keep "after wave".
+        local consumed = 0
         local ref = nil
         if kind == "research" and #args >= 1 then
             local id = tostring(args[1]):upper()
@@ -254,6 +258,7 @@ function refs.parse(text)
             end)
             if ok and rt ~= nil then
                 ref = { kind = "research", id = id }
+                consumed = 1
             end
         elseif kind == "map" and #args >= 1 then
             local name = tostring(args[1])
@@ -262,24 +267,42 @@ function refs.parse(text)
             end)
             if ok and lvl ~= nil then
                 ref = { kind = "map", id = name }
+                consumed = 1
             end
         elseif kind == "tile" and #args >= 2 then
             local cat = tostring(args[1]):upper()
-            local nums = {}
-            for i = 2, #args do
-                local n = tonumber(args[i] and tostring(args[i]):match("L?(%d+)"))
-                nums[#nums + 1] = n
+            -- Strict per-token validation. A previous version appended a possibly-nil
+            -- number, and assigning nil is a no-op that silently reuses the slot -
+            -- so "+tile REGULAR 1 A 3" produced {1,3} and invented x=1,y=3.
+            local function num(tok)
+                return tonumber(tostring(tok):match("^L?(%d+)$"))
             end
-            if cat == "REGULAR" and #nums >= 2 and nums[1] ~= nil and nums[2] ~= nil then
-                ref = { kind = "tile", cat = "REGULAR", level = 0, x = nums[1], y = nums[2] }
-            elseif #nums >= 3 and nums[1] ~= nil and nums[2] ~= nil and nums[3] ~= nil then
-                ref = { kind = "tile", cat = cat, level = nums[1], x = nums[2], y = nums[3] }
+            local function coord(tok)
+                return tonumber(tostring(tok):match("^(%d+)$"))
+            end
+            if cat == "REGULAR" then
+                local x, y = coord(args[2]), coord(args[3])
+                if x ~= nil and y ~= nil then
+                    ref = { kind = "tile", cat = "REGULAR", level = 0, x = x, y = y }
+                    consumed = 3
+                end
+            else
+                local lv, x, y = num(args[2]), coord(args[3]), coord(args[4])
+                if lv ~= nil and x ~= nil and y ~= nil then
+                    ref = { kind = "tile", cat = cat, level = lv, x = x, y = y }
+                    consumed = 4
+                end
             end
         end
 
         if ref ~= nil then
             found[#found + 1] = ref
-            return "" -- strip the consumed token from visible text
+            -- Strip only what was consumed, keep the rest as visible text.
+            local tail = {}
+            for i = consumed + 1, #args do
+                tail[#tail + 1] = args[i]
+            end
+            return (next(tail) ~= nil) and (" " .. table.concat(tail, " ")) or ""
         end
         return nil -- invalid ref: keep original text
     end)

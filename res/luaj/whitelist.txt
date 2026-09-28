@@ -39621,19 +39621,40 @@
      +m:captureCurrentGameSnapshotBase64:
      +m:clearStateHashSamples:
      +m:clearPendingStartupSync:
+     +m:cleanupApprovedQueuedActions:int
+     +m:cleanupStateHashSamples:int
      +m:consumeApprovedQueuedAction:int,String
      +m:describeConfig:
      +m:describePeers:
      +m:describeSession:
      +m:getConfigValidationError:
      +m:getConfigFilePath:
+     +m:highlightTileAt:int,int
+     +m:clearTileHighlights:
+     +m:showTileWarningParticleAt:int,int
+      +m:addTileMark:int,int,boolean,int
+      +m:tickTileMarks:
+      +m:respawnTileMarks:
+      +m:clearTileMarks:
+      +m:getTileMarkCount:
+      +m:getTileMarkCount:
+      +m:removeTileMarkAt:int,int
+      +m:setRemoteCursor:int,int,int
+      +m:clearRemoteCursor:int
+      +m:clearAllRemoteCursors:
+      +m:getCursorTileX:
+      +m:getCursorTileY:
+     +m:setSetting:String,String
+     +m:getSetting:String,String
      +m:getBridge:
      +m:getVersion:
      +m:getConnectedPeerCount:
+     +m:getConnectedPeerIds:
      +m:getConfiguredRoleName:
      +m:getConnectionStateName:
      +m:getLifecycleStateName:
      +m:getHost:
+     +m:getLatencyMillis:
      +m:getLocalPlayerId:
      +m:getPendingLuaMessageCount:
      +m:getPlayerName:
@@ -39650,6 +39671,7 @@
      +m:isSessionActive:
      +m:loadConfig:
      +m:pollInboundLuaMessageJson:
+     +m:reconnect:
      +m:resetApprovedQueuedActions:
      +m:resetConfig:
      +m:restoreGameSnapshotBase64:String,long
@@ -39669,27 +39691,3 @@
   }
  }
 }
-
-# multitode: bridge + marks + cursors entries added for 0.2.3
-     +m:cleanupApprovedQueuedActions:int
-     +m:cleanupStateHashSamples:int
-     +m:highlightTileAt:int,int
-     +m:clearTileHighlights:
-     +m:showTileWarningParticleAt:int,int
-      +m:addTileMark:int,int,boolean,int
-      +m:tickTileMarks:
-      +m:respawnTileMarks:
-      +m:clearTileMarks:
-      +m:getTileMarkCount:
-      +m:getTileMarkCount:
-      +m:removeTileMarkAt:int,int
-      +m:setRemoteCursor:int,int,int
-      +m:clearRemoteCursor:int
-      +m:clearAllRemoteCursors:
-      +m:getCursorTileX:
-      +m:getCursorTileY:
-     +m:setSetting:String,String
-     +m:getSetting:String,String
-     +m:getConnectedPeerIds:
-     +m:getLatencyMillis:
-     +m:reconnect:

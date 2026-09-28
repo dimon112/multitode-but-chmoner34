@@ -170,12 +170,23 @@ local function compute_effective_target(targetTick)
     return effectiveTargetTick
 end
 
+-- os.clock has a per-JVM origin (LuaJ stamps it when the lib loads), so a
+-- sent_wall value stamped by the OTHER process cannot be subtracted from it -
+-- the result carries the class-load delta. Return nil rather than a number that
+-- looks plausible and is not. sent_wall is still stamped for the same-process
+-- case and for cross-machine debugging via the raw value in the log.
 local function lag_ms_of(envelope)
     local sentWall = envelope ~= nil and tonumber(envelope.sent_wall) or nil
     if sentWall == nil or os.clock == nil then
         return nil
     end
-    return math.floor((os.clock() - sentWall) * 1000)
+    local delta = (os.clock() - sentWall) * 1000
+    -- A genuine lag never exceeds a few seconds; anything larger means the two
+    -- clocks came from different processes.
+    if delta < 0 or delta > 10000 then
+        return nil
+    end
+    return math.floor(delta)
 end
 
 local function enqueue_authoritative_action(envelope, sourceLabel)
@@ -460,6 +471,23 @@ local function ensure_handlers_registered()
         return
     end
     freshReqs[#freshReqs + 1] = { tick = reqTick, sig = reqSig }
+
+    -- Authority gate: bonus selection belongs to the host alone. A client that
+    -- reaches here has gone around bv.onQueuedBonusAction, which only guards the
+    -- client's own process, so the host has to refuse the origination itself.
+    -- Legitimate bonus actions never travel this way: the vote flow uses the
+    -- "bonus" channel and the host's local selectBonusAction, so a client-sent
+    -- SGB/RRB is always illegitimate. This also covers a client whose vote module
+    -- is broken and lets a raw SGB leak upward.
+    local reqType = tostring((payload.payload and payload.payload.queuedType) or payload.action or "")
+    if reqType == "SGB" or reqType == "RRB" then
+        pcall(function()
+            multitode.slog("ACT", string.format(
+                "REJECT client bonus-origin type=%s from player %s (host-only authority)",
+                reqType, tostring(ctx.senderPlayerId)))
+        end)
+        return
+    end
 
         -- Host stamps the single authoritative target tick BEFORE broadcasting,
         -- so both sides converge on the same tick instead of adjusting
@@ -839,9 +867,12 @@ local function ensure_handlers_registered()
         if payload == nil or tonumber(payload.t) == nil then
             return
         end
-        local rtt = (tonumber(payload.t) - ((os.clock and os.clock()) or 0)) * 1000
-        -- os.clock is per-process CPU time; within this process the delta is
-        -- a valid monotonic elapsed measure, so rtt >= 0 always.
+        local now = (os.clock and os.clock()) or 0
+        local rtt = (now - tonumber(payload.t)) * 1000
+        -- os.clock is wall-clock seconds since LuaJ loaded in THIS process, so it
+        -- measures elapsed time correctly for a stamp taken here. (It is not CPU
+        -- time, and its origin is per-JVM - which is why cross-process stamps such
+        -- as sent_wall must not be subtracted from it.)
         if rtt >= 0 and rtt < 60000 then
             multitode.luaRttMs = rtt
         end

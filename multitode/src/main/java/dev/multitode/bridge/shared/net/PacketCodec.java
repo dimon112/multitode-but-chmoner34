@@ -119,7 +119,14 @@ public final class PacketCodec {
     }
 
     public static PacketType readType(DataInputStream inputStream) throws IOException {
-        return PacketType.fromId(inputStream.readInt());
+        int id = inputStream.readInt();
+        PacketType type = PacketType.fromId(id);
+        if (type == null) {
+            // IOException on purpose: the session loops route it through their normal
+            // disconnect path, which is what version skew should do.
+            throw new IOException("Unknown packet type id: " + id);
+        }
+        return type;
     }
 
     private static void ensureType(DataInputStream inputStream, PacketType expectedType) throws IOException {
